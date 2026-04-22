@@ -28,6 +28,19 @@ Fill in:
 | `OPENROUTER_API_KEY` | —                             | required                               |
 | `MAP_MODEL`          | `google/gemini-2.5-flash`     | cheap/fast — digests raw chunks        |
 | `REDUCE_MODEL`       | `anthropic/claude-sonnet-4.5` | stronger — writes the final overview   |
+| `OCR_LANG`           | `eng`                         | Tesseract langs, e.g. `eng+chi_sim`    |
+| `OCR_DPI`            | `300`                         | render DPI for OCR pages               |
+
+Scanned PDFs are handled via a Tesseract fallback — install the binary once:
+
+```bash
+brew install tesseract leptonica # macOS
+# optional extra language packs, e.g. Simplified Chinese
+brew install tesseract-lang
+```
+
+The pipeline auto-detects it; you'll see `OCR [tesserocr, 8w] …` in the status bar
+when it's active (vs `OCR [pytesseract, 8w] …` on the fallback).
 
 Any OpenRouter-supported model slug works.
 
@@ -104,7 +117,7 @@ Flash handles the heavy lifting; Sonnet only sees ~7k tokens regardless of docum
 
 **Robustness.**
 
-* Scanned PDFs with zero extractable text surface a clear client-side error (OCR is out of scope for this MVP).
+* Scanned PDFs are auto-detected (≥50% of pages with no extractable text) and routed through a Tesseract OCR pass before the map-reduce pipeline — hybrid PDFs keep their native text layer where present.
 * Temp file is always cleaned up on success, error, or client disconnect.
 * The reducer is hard-capped at 15 sections server-side even if the model tries to produce more.
 
@@ -121,4 +134,4 @@ index.html     # single-page frontend: fetch + SSE reader + progressive table
 
 ## Scope
 
-This is an MVP. No persistence, no auth, no OCR, no queue. Each upload is processed in-memory (plus one temp file) and the result is ephemeral — reload the page and the overview is gone. Good enough to demo the idea end-to-end; swap in a real storage layer and job queue before shipping.
+This is an MVP. No persistence, no auth, no queue. Each upload is processed in-memory (plus one temp file) and the result is ephemeral — reload the page and the overview is gone. Good enough to demo the idea end-to-end; swap in a real storage layer and job queue before shipping.

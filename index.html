@@ -317,7 +317,9 @@
   const runError = $("runError");
   const resetBtn = $("resetBtn");
 
-  drop.addEventListener("click", () => fileInput.click());
+  // NB: the <label class="drop"> already forwards clicks to its <input> natively.
+  // Adding a JS click handler here would fire a second input.click(), which dismisses
+  // the first-opened file picker and makes the first click appear to do nothing.
   drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("drag"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("drag"));
   drop.addEventListener("drop", (e) => {
