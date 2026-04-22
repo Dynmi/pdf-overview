@@ -30,6 +30,29 @@ def _get_client() -> httpx.AsyncClient:
     return _CLIENT
 
 
+def cached_system(text: str) -> list[dict]:
+    """Build a system-message content array that signals a cache breakpoint to
+    providers that honor OpenRouter's `cache_control` passthrough (Anthropic,
+    some others). On models that ignore it (Gemini), the structure still parses
+    as plain text and nothing breaks. For Anthropic Claude specifically, every
+    call after the first hits the cache for this prefix — reducing input-token
+    cost by up to ~90% across repeated fan-out."""
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+async def warmup() -> None:
+    """Open a TCP+TLS (and HTTP/2) connection to OpenRouter and leave it in the
+    pool, so the first real chat request doesn't pay handshake cost (~150ms)."""
+    try:
+        await _get_client().head(
+            "https://openrouter.ai/api/v1/models",
+            timeout=httpx.Timeout(5.0, connect=3.0),
+        )
+    except Exception:
+        # Best-effort; failure here doesn't affect correctness.
+        pass
+
+
 def _headers() -> dict:
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:

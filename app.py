@@ -13,12 +13,20 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
+from llm import warmup as llm_warmup
 from pipeline import process
 
 load_dotenv()
 
 ROOT = Path(__file__).parent
 app = FastAPI(title="PDF Overview")
+
+
+@app.on_event("startup")
+async def _warm_llm_pool() -> None:
+    # Pre-establish TLS/HTTP2 to OpenRouter so first upload doesn't pay handshake.
+    import asyncio as _asyncio
+    _asyncio.create_task(llm_warmup())
 
 
 @app.get("/")

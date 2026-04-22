@@ -9,7 +9,7 @@ from typing import AsyncIterator
 
 import fitz  # PyMuPDF
 
-from llm import chat, chat_stream
+from llm import cached_system, chat, chat_stream
 
 MAP_MODEL = os.getenv("MAP_MODEL", "google/gemini-2.5-flash")
 REDUCE_MODEL = os.getenv("REDUCE_MODEL", "anthropic/claude-sonnet-4.5")
@@ -48,17 +48,81 @@ Rules:
 - Start streaming immediately from line 1. Never emit commentary, backticks, or empty lines."""
 
 
-def extract_pages(pdf_path: str) -> tuple[list[str], int, int, list[int]]:
-    """Extract text per page. Returns (pages, page_count, word_count, ocr_indices)
-    where ocr_indices lists pages that came back empty and need OCR."""
+_ROMAN_RE = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
+
+
+def _strip_boilerplate(pages: list[str]) -> list[str]:
+    """Drop lines that are clearly not substantive content:
+      - Short lines that repeat on many pages (running headers/footers).
+      - Pure page numbers (arabic or roman).
+      - Common bibliographic noise like "bare URLs" / lone DOI lines is left
+        to the LLM — only high-precision rules here.
+
+    We're intentionally conservative: under-pruning is fine (LLM handles it);
+    over-pruning costs real content. The threshold is occurring on ≥30% of
+    pages AND being short (≤80 chars)."""
+    n = len(pages)
+    if n < 5:
+        return pages
+
+    # Build: line → set of page indices (dedup within a page).
+    line_pages: dict[str, set[int]] = {}
+    for i, p in enumerate(pages):
+        seen: set[str] = set()
+        for raw in p.splitlines():
+            s = raw.strip()
+            if 0 < len(s) <= 80 and s not in seen:
+                seen.add(s)
+                line_pages.setdefault(s, set()).add(i)
+
+    threshold = max(3, int(n * 0.3))
+    boilerplate = {s for s, pgs in line_pages.items() if len(pgs) >= threshold}
+
+    def is_page_number(s: str) -> bool:
+        if not s:
+            return False
+        if s.isdigit() and len(s) <= 4:
+            return True
+        if _ROMAN_RE.match(s) and len(s) <= 6:
+            return True
+        # "Page 12", "12 / 300", "- 12 -"
+        if re.match(r"^[\-–—]?\s*(page\s+)?\d+\s*(/\s*\d+)?\s*[\-–—]?$", s, re.IGNORECASE):
+            return True
+        return False
+
+    out: list[str] = []
+    for p in pages:
+        kept: list[str] = []
+        for raw in p.splitlines():
+            s = raw.strip()
+            if not s:
+                kept.append(raw)
+                continue
+            if s in boilerplate:
+                continue
+            if is_page_number(s):
+                continue
+            kept.append(raw)
+        out.append("\n".join(kept))
+    return out
+
+
+def extract_pages(pdf_path: str) -> tuple[list[str], int, int, list[int], int]:
+    """Extract text per page. Returns
+      (pages, page_count, word_count, ocr_indices, chars_stripped)
+    where `chars_stripped` reports how much boilerplate was removed so the
+    pipeline can surface the saving to the user."""
     doc = fitz.open(pdf_path)
     try:
-        pages = [p.get_text() or "" for p in doc]
+        raw_pages = [p.get_text() or "" for p in doc]
     finally:
         doc.close()
+    before = sum(len(p) for p in raw_pages)
+    pages = _strip_boilerplate(raw_pages)
+    after = sum(len(p) for p in pages)
     ocr_indices = [i for i, p in enumerate(pages) if len(p.strip()) < OCR_PAGE_MIN_CHARS]
     word_count = sum(len(p.split()) for p in pages)
-    return pages, len(pages), word_count, ocr_indices
+    return pages, len(pages), word_count, ocr_indices, max(0, before - after)
 
 
 def _parse_psm(config: str) -> int:
@@ -121,6 +185,59 @@ def _render_gray(page, dpi: int):
     return Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
 
+def _tesserocr_text_filtered(api, min_conf: float) -> str:
+    """Walk tesserocr's ResultIterator, dropping words below `min_conf`. Keeps
+    paragraph/line breaks so chunking downstream still sees structure."""
+    import tesserocr
+    RIL = tesserocr.RIL
+    api.Recognize()
+    it = api.GetIterator()
+    if it is None:
+        return api.GetUTF8Text() or ""
+    out_lines: list[str] = []
+    current: list[str] = []
+    while True:
+        try:
+            word = it.GetUTF8Text(RIL.WORD)
+            conf = it.Confidence(RIL.WORD)
+        except RuntimeError:
+            # iterator exhausted mid-step on some tesseract versions
+            break
+        if word and conf >= min_conf:
+            current.append(word)
+        end_of_line = it.IsAtFinalElement(RIL.TEXTLINE, RIL.WORD)
+        end_of_para = it.IsAtFinalElement(RIL.PARA, RIL.WORD)
+        if end_of_line and current:
+            out_lines.append(" ".join(current))
+            current = []
+        if end_of_para:
+            out_lines.append("")  # blank line between paragraphs
+        if not it.Next(RIL.WORD):
+            break
+    if current:
+        out_lines.append(" ".join(current))
+    return "\n".join(out_lines).strip()
+
+
+def _pytesseract_text_filtered(img, lang: str, config: str, min_conf: float) -> str:
+    """Same filtering for the pytesseract fallback, via image_to_data."""
+    import pytesseract
+    data = pytesseract.image_to_data(
+        img, lang=lang, config=config, output_type=pytesseract.Output.DICT
+    )
+    lines: dict[tuple, list[str]] = {}
+    for i, word in enumerate(data["text"]):
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if not word or not word.strip() or conf < min_conf:
+            continue
+        key = (data["page_num"][i], data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+    return "\n".join(" ".join(ws) for ws in lines.values()).strip()
+
+
 async def ocr_pages_streaming(
     pdf_path: str,
     page_indices: list[int],
@@ -136,6 +253,7 @@ async def ocr_pages_streaming(
     lang = os.getenv("OCR_LANG", "eng")
     dpi = int(os.getenv("OCR_DPI", "200"))
     config = os.getenv("OCR_CONFIG", "--oem 1 --psm 6")
+    min_conf = float(os.getenv("OCR_MIN_CONF", "55"))
     backend, tessdata = _detect_ocr_backend()
     n_workers = min(
         int(os.getenv("OCR_WORKERS", str(os.cpu_count() or 4))),
@@ -167,10 +285,9 @@ async def ocr_pages_streaming(
                     img = _render_gray(doc[i], dpi)
                     if backend == "tesserocr":
                         api.SetImage(img)
-                        text = api.GetUTF8Text() or ""
+                        text = _tesserocr_text_filtered(api, min_conf)
                     else:
-                        import pytesseract
-                        text = pytesseract.image_to_string(img, lang=lang, config=config) or ""
+                        text = _pytesseract_text_filtered(img, lang, config, min_conf)
                     loop.call_soon_threadsafe(queue.put_nowait, ("page", (i, text)))
             finally:
                 if api is not None:
@@ -244,7 +361,7 @@ async def _map_chunk(text: str, sem: asyncio.Semaphore) -> str:
         return await chat(
             MAP_MODEL,
             [
-                {"role": "system", "content": MAP_SYSTEM},
+                {"role": "system", "content": cached_system(MAP_SYSTEM)},
                 {"role": "user", "content": text},
             ],
             temperature=0.2,
@@ -275,7 +392,12 @@ async def _parse_ndjson_stream(token_stream: AsyncIterator[str]) -> AsyncIterato
 async def process(pdf_path: str, filename: str) -> AsyncIterator[dict]:
     """Yield overview events: document, status, meta, section, done, error."""
     # Run the (potentially slow, blocking) extraction off the event loop.
-    pages, page_count, word_count, ocr_indices = await asyncio.to_thread(extract_pages, pdf_path)
+    pages, page_count, word_count, ocr_indices, stripped = await asyncio.to_thread(extract_pages, pdf_path)
+    if stripped > 2000:
+        yield {
+            "kind": "status",
+            "message": f"Stripped {stripped // 1000}k chars of headers/footers/page numbers.",
+        }
 
     # OCR fallback: if a meaningful share of pages came back empty, assume scanned
     # and fill them in. Emit status first so the user isn't staring at a blank UI.
@@ -388,7 +510,7 @@ async def process(pdf_path: str, filename: str) -> AsyncIterator[dict]:
     stream = chat_stream(
         REDUCE_MODEL,
         [
-            {"role": "system", "content": REDUCE_SYSTEM},
+            {"role": "system", "content": cached_system(REDUCE_SYSTEM)},
             {"role": "user", "content": reduce_user},
         ],
         temperature=0.4,
